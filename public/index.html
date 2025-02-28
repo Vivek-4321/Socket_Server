@@ -1,0 +1,1522 @@
+<!-- <!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC SFU Client</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+
+      .container {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .controls {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 20px;
+      }
+
+      .room-info {
+        margin-bottom: 20px;
+      }
+
+      .video-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 20px;
+      }
+
+      .video-container {
+        position: relative;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+      }
+
+      video {
+        width: 100%;
+        background-color: #eee;
+        border-radius: 4px;
+      }
+
+      .label {
+        position: absolute;
+        bottom: 20px;
+        left: 20px;
+        background-color: rgba(0, 0, 0, 0.5);
+        color: white;
+        padding: 5px 10px;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>WebRTC SFU Video Conference</h1>
+
+      <div class="controls">
+        <input type="text" id="roomIdInput" placeholder="Room ID" />
+        <button id="joinBtn">Join Room</button>
+        <button id="leaveBtn">Leave Room</button>
+        <button id="publishBtn">Start Publishing</button>
+        <button id="stopPublishBtn">Stop Publishing</button>
+      </div>
+
+      <div class="room-info">
+        <p>Current Room: <span id="currentRoom">Not connected</span></p>
+      </div>
+
+      <div class="video-grid">
+        <div class="video-container">
+          <video id="localVideo" autoplay muted playsinline></video>
+          <div class="label">You (Local)</div>
+        </div>
+        <div id="remoteVideos"></div>
+      </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        // DOM Elements
+        const joinBtn = document.getElementById("joinBtn");
+        const leaveBtn = document.getElementById("leaveBtn");
+        const publishBtn = document.getElementById("publishBtn");
+        const stopPublishBtn = document.getElementById("stopPublishBtn");
+        const roomIdInput = document.getElementById("roomIdInput");
+        const currentRoomSpan = document.getElementById("currentRoom");
+        const localVideo = document.getElementById("localVideo");
+        const remoteVideos = document.getElementById("remoteVideos");
+
+        // State variables
+        let socket;
+        let currentRoom = null;
+        let localStream = null;
+        let isPublishing = false;
+        let publishers = {}; // publisherId -> RTCPeerConnection
+        let consumers = {}; // publisherId -> RTCPeerConnection
+
+        // Connect to signaling server
+        function connectSocket() {
+          socket = io.connect();
+
+          // Socket event handlers
+          socket.on("connect", () => {
+            console.log("Connected to signaling server");
+          });
+
+          socket.on("joined", (roomId) => {
+            currentRoom = roomId;
+            currentRoomSpan.textContent = roomId;
+            console.log(`Joined room: ${roomId}`);
+          });
+
+          socket.on("existingPublishers", (publisherIds) => {
+            console.log("Existing publishers:", publisherIds);
+            publisherIds.forEach((id) => {
+              subscribeToPublisher(id);
+            });
+          });
+
+          socket.on("newPublisher", (publisherId) => {
+            console.log(`New publisher: ${publisherId}`);
+            subscribeToPublisher(publisherId);
+          });
+
+          socket.on("publisherLeft", (publisherId) => {
+            console.log(`Publisher left: ${publisherId}`);
+            removePublisher(publisherId);
+          });
+
+          socket.on("subscribeRequest", (consumerId) => {
+            console.log(`Subscription request from: ${consumerId}`);
+            setupPublisherConnection(consumerId);
+          });
+
+          socket.on("publisherSignaling", async (data) => {
+            const { publisherId, signal } = data;
+
+            if (!consumers[publisherId]) {
+              consumers[publisherId] = setupConsumerConnection(publisherId);
+            }
+
+            try {
+              if (signal.type === "offer") {
+                await consumers[publisherId].setRemoteDescription(
+                  new RTCSessionDescription(signal)
+                );
+                const answer = await consumers[publisherId].createAnswer();
+                await consumers[publisherId].setLocalDescription(answer);
+
+                socket.emit("consumerSignal", {
+                  publisherId: publisherId,
+                  signal: answer,
+                });
+              } else if (signal.type === "ice-candidate" && signal.candidate) {
+                await consumers[publisherId].addIceCandidate(
+                  new RTCIceCandidate(signal.candidate)
+                );
+              }
+            } catch (e) {
+              console.error("Error handling publisher signal:", e);
+            }
+          });
+
+          socket.on("consumerSignaling", async (data) => {
+            const { consumerId, signal } = data;
+
+            try {
+              if (signal.type === "answer") {
+                await publishers[consumerId].setRemoteDescription(
+                  new RTCSessionDescription(signal)
+                );
+              } else if (signal.type === "ice-candidate" && signal.candidate) {
+                await publishers[consumerId].addIceCandidate(
+                  new RTCIceCandidate(signal.candidate)
+                );
+              }
+            } catch (e) {
+              console.error("Error handling consumer signal:", e);
+            }
+          });
+
+          socket.on("disconnect", () => {
+            console.log("Disconnected from signaling server");
+            cleanupRoom();
+          });
+        }
+
+        // Join a room
+        joinBtn.addEventListener("click", () => {
+          const roomId = roomIdInput.value.trim();
+          if (roomId) {
+            if (!socket) {
+              connectSocket();
+            }
+
+            socket.emit("join", roomId);
+          } else {
+            alert("Please enter a room ID");
+          }
+        });
+
+        // Leave the current room
+        leaveBtn.addEventListener("click", () => {
+          if (socket && currentRoom) {
+            stopPublishing();
+            socket.emit("leave");
+            cleanupRoom();
+          }
+        });
+
+        // Start publishing local stream
+        publishBtn.addEventListener("click", async () => {
+          if (!socket || !currentRoom) {
+            alert("Please join a room first");
+            return;
+          }
+
+          if (isPublishing) return;
+
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: true,
+            });
+
+            localVideo.srcObject = localStream;
+            isPublishing = true;
+
+            socket.emit("publish", {
+              audio: true,
+              video: true,
+            });
+          } catch (e) {
+            console.error("Error getting media:", e);
+            alert(`Failed to access camera and microphone: ${e.message}`);
+          }
+        });
+
+        // Stop publishing
+        stopPublishBtn.addEventListener("click", () => {
+          stopPublishing();
+        });
+
+        function stopPublishing() {
+          if (localStream) {
+            localStream.getTracks().forEach((track) => track.stop());
+            localVideo.srcObject = null;
+            localStream = null;
+          }
+
+          isPublishing = false;
+
+          // Close all publisher connections
+          Object.values(publishers).forEach((pc) => pc.close());
+          publishers = {};
+        }
+
+        function cleanupRoom() {
+          stopPublishing();
+
+          // Close all consumer connections
+          Object.values(consumers).forEach((pc) => pc.close());
+          consumers = {};
+
+          // Clear all remote videos
+          remoteVideos.innerHTML = "";
+
+          currentRoom = null;
+          currentRoomSpan.textContent = "Not connected";
+        }
+
+        // Subscribe to a publisher
+        function subscribeToPublisher(publisherId) {
+          socket.emit("subscribe", publisherId);
+        }
+
+        // Remove a publisher when they leave
+        function removePublisher(publisherId) {
+          if (consumers[publisherId]) {
+            consumers[publisherId].close();
+            delete consumers[publisherId];
+          }
+
+          const videoEl = document.getElementById(`remote-${publisherId}`);
+          if (videoEl) {
+            videoEl.parentNode.remove();
+          }
+        }
+
+        // Setup a consumer connection to receive a publisher's stream
+        function setupConsumerConnection(publisherId) {
+          const pc = new RTCPeerConnection({
+            iceServers: [
+              {
+                urls: "stun:stun.relay.metered.ca:80",
+              },
+              {
+                urls: "turn:global.relay.metered.ca:80",
+                username: "f5baae95181d1a3b2947f791",
+                credential: "n67tiC1skstIO4zc",
+              },
+              {
+                urls: "turn:global.relay.metered.ca:80?transport=tcp",
+                username: "f5baae95181d1a3b2947f791",
+                credential: "n67tiC1skstIO4zc",
+              },
+              {
+                urls: "turn:global.relay.metered.ca:443",
+                username: "f5baae95181d1a3b2947f791",
+                credential: "n67tiC1skstIO4zc",
+              },
+              {
+                urls: "turns:global.relay.metered.ca:443?transport=tcp",
+                username: "f5baae95181d1a3b2947f791",
+                credential: "n67tiC1skstIO4zc",
+              },
+            ],
+          });
+
+          // Handle ICE candidates
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              socket.emit("consumerSignal", {
+                publisherId: publisherId,
+                signal: {
+                  type: "ice-candidate",
+                  candidate: event.candidate,
+                },
+              });
+            }
+          };
+
+          // Handle incoming tracks
+          pc.ontrack = (event) => {
+            const stream = event.streams[0];
+
+            let videoContainer = document.getElementById(
+              `container-${publisherId}`
+            );
+            if (!videoContainer) {
+              videoContainer = document.createElement("div");
+              videoContainer.id = `container-${publisherId}`;
+              videoContainer.className = "video-container";
+
+              const video = document.createElement("video");
+              video.id = `remote-${publisherId}`;
+              video.autoplay = true;
+              video.playsInline = true;
+
+              const label = document.createElement("div");
+              label.className = "label";
+              label.textContent = `Remote (${publisherId.substring(0, 6)}...)`;
+
+              videoContainer.appendChild(video);
+              videoContainer.appendChild(label);
+              remoteVideos.appendChild(videoContainer);
+            }
+
+            const videoEl = document.getElementById(`remote-${publisherId}`);
+            videoEl.srcObject = stream;
+
+            socket.emit("consumerConnected", publisherId);
+          };
+
+          pc.onconnectionstatechange = () => {
+            console.log(
+              `Consumer connection state (${publisherId}):`,
+              pc.connectionState
+            );
+            if (
+              pc.connectionState === "failed" ||
+              pc.connectionState === "closed"
+            ) {
+              removePublisher(publisherId);
+            }
+          };
+
+          return pc;
+        }
+
+        // Setup a publisher connection to send our stream to a consumer
+        function setupPublisherConnection(consumerId) {
+          if (publishers[consumerId]) {
+            publishers[consumerId].close();
+          }
+
+          const pc = new RTCPeerConnection({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+          });
+
+          // Add local tracks to the connection
+          if (localStream) {
+            localStream.getTracks().forEach((track) => {
+              pc.addTrack(track, localStream);
+            });
+          }
+
+          // Handle ICE candidates
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              socket.emit("publisherSignal", {
+                consumerId: consumerId,
+                signal: {
+                  type: "ice-candidate",
+                  candidate: event.candidate,
+                },
+              });
+            }
+          };
+
+          pc.onconnectionstatechange = () => {
+            console.log(
+              `Publisher connection state (${consumerId}):`,
+              pc.connectionState
+            );
+          };
+
+          // Create and send offer
+          pc.createOffer()
+            .then((offer) => pc.setLocalDescription(offer))
+            .then(() => {
+              socket.emit("publisherSignal", {
+                consumerId: consumerId,
+                signal: pc.localDescription,
+              });
+            })
+            .catch((e) => {
+              console.error("Error creating offer:", e);
+            });
+
+          publishers[consumerId] = pc;
+          return pc;
+        }
+      });
+    </script>
+  </body>
+</html> -->
+<!-- 
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC SFU Client</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+
+      .container {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .controls {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 20px;
+      }
+
+      .room-info {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 20px;
+      }
+
+      .video-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 20px;
+      }
+
+      .video-container {
+        position: relative;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+      }
+
+      video {
+        width: 100%;
+        height: 225px;
+        background-color: #eee;
+        border-radius: 4px;
+        object-fit: cover;
+      }
+
+      .label {
+        position: absolute;
+        bottom: 20px;
+        left: 20px;
+        background-color: rgba(0, 0, 0, 0.5);
+        color: white;
+        padding: 5px 10px;
+        border-radius: 4px;
+      }
+
+      .status {
+        padding: 5px 10px;
+        border-radius: 4px;
+        background-color: #f0f0f0;
+      }
+
+      .status.connected {
+        background-color: #d4edda;
+        color: #155724;
+      }
+
+      .status.disconnected {
+        background-color: #f8d7da;
+        color: #721c24;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>WebRTC SFU Video Conference</h1>
+
+      <div class="controls">
+        <input
+          type="text"
+          id="roomIdInput"
+          placeholder="Room ID"
+          value="test-room"
+        />
+        <button id="joinBtn">Join Room</button>
+        <button id="leaveBtn">Leave Room</button>
+        <button id="toggleVideoBtn">Toggle Video</button>
+        <button id="toggleAudioBtn">Toggle Audio</button>
+      </div>
+
+      <div class="room-info">
+        <div>
+          <p>Current Room: <span id="currentRoom">Not connected</span></p>
+          <p>Participants: <span id="participantCount">0</span></p>
+        </div>
+        <div class="status disconnected" id="connectionStatus">
+          Disconnected
+        </div>
+      </div>
+
+      <div class="video-grid" id="videoGrid">
+        <div class="video-container">
+          <video id="localVideo" autoplay muted playsinline></video>
+          <div class="label">You (Local)</div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        // DOM Elements
+        const joinBtn = document.getElementById("joinBtn");
+        const leaveBtn = document.getElementById("leaveBtn");
+        const toggleVideoBtn = document.getElementById("toggleVideoBtn");
+        const toggleAudioBtn = document.getElementById("toggleAudioBtn");
+        const roomIdInput = document.getElementById("roomIdInput");
+        const currentRoomSpan = document.getElementById("currentRoom");
+        const participantCountSpan =
+          document.getElementById("participantCount");
+        const connectionStatusDiv = document.getElementById("connectionStatus");
+        const localVideo = document.getElementById("localVideo");
+        const videoGrid = document.getElementById("videoGrid");
+
+        // WebRTC configuration
+        const rtcConfig = {
+          iceServers: [
+            {
+              urls: "stun:stun.relay.metered.ca:80",
+            },
+            {
+              urls: "turn:global.relay.metered.ca:80",
+              username: "f5baae95181d1a3b2947f791",
+              credential: "n67tiC1skstIO4zc",
+            },
+            {
+              urls: "turn:global.relay.metered.ca:80?transport=tcp",
+              username: "f5baae95181d1a3b2947f791",
+              credential: "n67tiC1skstIO4zc",
+            },
+            {
+              urls: "turn:global.relay.metered.ca:443",
+              username: "f5baae95181d1a3b2947f791",
+              credential: "n67tiC1skstIO4zc",
+            },
+            {
+              urls: "turns:global.relay.metered.ca:443?transport=tcp",
+              username: "f5baae95181d1a3b2947f791",
+              credential: "n67tiC1skstIO4zc",
+            },
+          ],
+        };
+
+        // State variables
+        let socket;
+        let currentRoom = null;
+        let localStream = null;
+        let publisherPc = null; // Connection to send our media to the server
+        const consumerPcs = new Map(); // Connections to receive media from the server (one per remote participant)
+        const remoteParticipants = new Set(); // Set of participant IDs
+
+        // Update connection status UI
+        function updateConnectionStatus(status, connected = false) {
+          connectionStatusDiv.textContent = status;
+          if (connected) {
+            connectionStatusDiv.classList.remove("disconnected");
+            connectionStatusDiv.classList.add("connected");
+          } else {
+            connectionStatusDiv.classList.remove("connected");
+            connectionStatusDiv.classList.add("disconnected");
+          }
+        }
+
+        // Update participant count UI
+        function updateParticipantCount() {
+          participantCountSpan.textContent = remoteParticipants.size;
+        }
+
+        // Connect to signaling server
+        function connectSocket() {
+          if (socket) return;
+
+          socket = io.connect();
+
+          socket.on("connect", () => {
+            console.log("Connected to signaling server");
+            updateConnectionStatus("Connected to server", true);
+          });
+
+          socket.on("disconnect", () => {
+            console.log("Disconnected from signaling server");
+            updateConnectionStatus("Disconnected from server");
+            cleanupRoom();
+          });
+
+          socket.on("roomJoined", (data) => {
+            console.log(
+              `Joined room: ${data.roomId}, existing participants:`,
+              data.participants
+            );
+            currentRoom = data.roomId;
+            currentRoomSpan.textContent = data.roomId;
+
+            // Add existing participants
+            data.participants.forEach((participantId) => {
+              addRemoteParticipant(participantId);
+            });
+            updateParticipantCount();
+
+            // Start publishing our media
+            startPublishing();
+          });
+
+          socket.on("participantJoined", (participantId) => {
+            console.log(`Participant joined: ${participantId}`);
+            addRemoteParticipant(participantId);
+            updateParticipantCount();
+          });
+
+          socket.on("participantLeft", (participantId) => {
+            console.log(`Participant left: ${participantId}`);
+            removeRemoteParticipant(participantId);
+            updateParticipantCount();
+          });
+
+          socket.on("sessionDescription", async (data) => {
+            try {
+              // If this is an answer to our publisher offer
+              if (data.type === "publisher") {
+                if (publisherPc) {
+                  await publisherPc.setRemoteDescription(
+                    new RTCSessionDescription(data.sdp)
+                  );
+                  console.log(
+                    "Set publisher remote description (answer from server)"
+                  );
+                }
+              }
+              // If this is an offer for a consumer
+              else if (data.type === "consumer") {
+                const { publisherId, sdp } = data;
+                console.log(`Received consumer offer for ${publisherId}`);
+
+                // Create consumer connection if it doesn't exist
+                let consumerPc = consumerPcs.get(publisherId);
+                if (!consumerPc) {
+                  consumerPc = createConsumerPeerConnection(publisherId);
+                  consumerPcs.set(publisherId, consumerPc);
+                }
+
+                // Set remote description (offer)
+                await consumerPc.setRemoteDescription(
+                  new RTCSessionDescription(sdp)
+                );
+
+                // Create and set local description (answer)
+                const answer = await consumerPc.createAnswer();
+                await consumerPc.setLocalDescription(answer);
+
+                // Send answer to server
+                socket.emit("consumerAnswer", {
+                  publisherId: publisherId,
+                  sdp: answer,
+                });
+              }
+            } catch (error) {
+              console.error("Error handling session description:", error);
+            }
+          });
+
+          socket.on("iceCandidate", async (data) => {
+            try {
+              const { type, publisherId, candidate } = data;
+
+              if (type === "publisher" && publisherPc) {
+                await publisherPc.addIceCandidate(
+                  new RTCIceCandidate(candidate)
+                );
+              } else if (type === "consumer" && publisherId) {
+                const consumerPc = consumerPcs.get(publisherId);
+                if (consumerPc) {
+                  await consumerPc.addIceCandidate(
+                    new RTCIceCandidate(candidate)
+                  );
+                }
+              }
+            } catch (error) {
+              console.error("Error handling ICE candidate:", error);
+            }
+          });
+        }
+
+        // Join a room
+        joinBtn.addEventListener("click", () => {
+          const roomId = roomIdInput.value.trim();
+          if (!roomId) {
+            alert("Please enter a room ID");
+            return;
+          }
+
+          connectSocket();
+
+          // Request camera/microphone access
+          navigator.mediaDevices
+            .getUserMedia({ video: true, audio: true })
+            .then((stream) => {
+              localStream = stream;
+              localVideo.srcObject = stream;
+
+              // Join the room
+              socket.emit("joinRoom", roomId);
+            })
+            .catch((error) => {
+              console.error("Error accessing media devices:", error);
+              alert(`Failed to access camera and microphone: ${error.message}`);
+            });
+        });
+
+        // Leave the room
+        leaveBtn.addEventListener("click", () => {
+          if (socket && currentRoom) {
+            socket.emit("leaveRoom");
+            cleanupRoom();
+          }
+        });
+
+        // Toggle video
+        toggleVideoBtn.addEventListener("click", () => {
+          if (localStream) {
+            const videoTrack = localStream.getVideoTracks()[0];
+            if (videoTrack) {
+              videoTrack.enabled = !videoTrack.enabled;
+              toggleVideoBtn.textContent = videoTrack.enabled
+                ? "Disable Video"
+                : "Enable Video";
+            }
+          }
+        });
+
+        // Toggle audio
+        toggleAudioBtn.addEventListener("click", () => {
+          if (localStream) {
+            const audioTrack = localStream.getAudioTracks()[0];
+            if (audioTrack) {
+              audioTrack.enabled = !audioTrack.enabled;
+              toggleAudioBtn.textContent = audioTrack.enabled
+                ? "Mute Audio"
+                : "Unmute Audio";
+            }
+          }
+        });
+
+        // Start publishing our media to the server
+        function startPublishing() {
+          if (!localStream || !socket) return;
+
+          // Create a new RTCPeerConnection for publishing
+          publisherPc = new RTCPeerConnection(rtcConfig);
+
+          // Add all local tracks to this connection
+          localStream.getTracks().forEach((track) => {
+            publisherPc.addTrack(track, localStream);
+          });
+
+          // Handle ICE candidates
+          publisherPc.onicecandidate = (event) => {
+            if (event.candidate) {
+              socket.emit("iceCandidate", {
+                type: "publisher",
+                candidate: event.candidate,
+              });
+            }
+          };
+
+          // Handle connection state changes
+          publisherPc.onconnectionstatechange = () => {
+            console.log(
+              "Publisher connection state:",
+              publisherPc.connectionState
+            );
+          };
+
+          // Create an offer to send our media
+          publisherPc
+            .createOffer()
+            .then((offer) => publisherPc.setLocalDescription(offer))
+            .then(() => {
+              // Send the offer to the server
+              socket.emit("publisherOffer", publisherPc.localDescription);
+            })
+            .catch((error) => {
+              console.error("Error creating publisher offer:", error);
+            });
+        }
+
+        // Create a peer connection to receive media for a specific participant
+        function createConsumerPeerConnection(publisherId) {
+          const pc = new RTCPeerConnection(rtcConfig);
+
+          // Handle incoming tracks
+          pc.ontrack = (event) => {
+            console.log(`Received track from ${publisherId}`);
+
+            // Get the remote stream
+            const remoteStream = event.streams[0];
+
+            // Create or get the video element for this participant
+            let videoContainer = document.getElementById(
+              `container-${publisherId}`
+            );
+            if (!videoContainer) {
+              videoContainer = document.createElement("div");
+              videoContainer.id = `container-${publisherId}`;
+              videoContainer.className = "video-container";
+
+              const video = document.createElement("video");
+              video.id = `remote-${publisherId}`;
+              video.autoplay = true;
+              video.playsInline = true;
+
+              const label = document.createElement("div");
+              label.className = "label";
+              label.textContent = `Participant ${publisherId.substring(
+                0,
+                6
+              )}...`;
+
+              videoContainer.appendChild(video);
+              videoContainer.appendChild(label);
+              videoGrid.appendChild(videoContainer);
+            }
+
+            // Set the stream as the source for the video element
+            const videoEl = document.getElementById(`remote-${publisherId}`);
+            if (videoEl && videoEl.srcObject !== remoteStream) {
+              videoEl.srcObject = remoteStream;
+            }
+          };
+
+          // Handle ICE candidates
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              socket.emit("iceCandidate", {
+                type: "consumer",
+                publisherId: publisherId,
+                candidate: event.candidate,
+              });
+            }
+          };
+
+          // Handle connection state changes
+          pc.onconnectionstatechange = () => {
+            console.log(
+              `Consumer connection state (${publisherId}):`,
+              pc.connectionState
+            );
+
+            if (
+              pc.connectionState === "failed" ||
+              pc.connectionState === "closed"
+            ) {
+              removeRemoteParticipant(publisherId);
+            }
+          };
+
+          return pc;
+        }
+
+        // Add a remote participant
+        function addRemoteParticipant(participantId) {
+          remoteParticipants.add(participantId);
+
+          // We don't create the consumer connection here - it will be created
+          // when we receive the consumer offer from the server
+        }
+
+        // Remove a remote participant
+        function removeRemoteParticipant(participantId) {
+          remoteParticipants.delete(participantId);
+
+          // Close and remove the consumer connection
+          const consumerPc = consumerPcs.get(participantId);
+          if (consumerPc) {
+            consumerPc.close();
+            consumerPcs.delete(participantId);
+          }
+
+          // Remove the video element
+          const videoContainer = document.getElementById(
+            `container-${participantId}`
+          );
+          if (videoContainer) {
+            videoContainer.remove();
+          }
+        }
+
+        // Clean up when leaving a room
+        function cleanupRoom() {
+          // Close publisher connection
+          if (publisherPc) {
+            publisherPc.close();
+            publisherPc = null;
+          }
+
+          // Close all consumer connections
+          for (const pc of consumerPcs.values()) {
+            pc.close();
+          }
+          consumerPcs.clear();
+
+          // Stop all tracks in the local stream
+          if (localStream) {
+            localStream.getTracks().forEach((track) => track.stop());
+            localVideo.srcObject = null;
+            localStream = null;
+          }
+
+          // Clear all remote video elements
+          for (const participantId of remoteParticipants) {
+            const videoContainer = document.getElementById(
+              `container-${participantId}`
+            );
+            if (videoContainer) {
+              videoContainer.remove();
+            }
+          }
+
+          // Reset state
+          remoteParticipants.clear();
+          currentRoom = null;
+          currentRoomSpan.textContent = "Not connected";
+          updateParticipantCount();
+          updateConnectionStatus("Disconnected");
+
+          // Reset button text
+          toggleVideoBtn.textContent = "Toggle Video";
+          toggleAudioBtn.textContent = "Toggle Audio";
+        }
+      });
+    </script>
+  </body>
+</html> -->
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC SFU Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .room-info {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+        
+        .video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .video-container {
+            position: relative;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+        }
+        
+        video {
+            width: 100%;
+            height: 225px;
+            background-color: #eee;
+            border-radius: 4px;
+            object-fit: cover;
+        }
+        
+        .label {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background-color: rgba(0, 0, 0, 0.5);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+        }
+        
+        .status {
+            padding: 5px 10px;
+            border-radius: 4px;
+            background-color: #f0f0f0;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebRTC SFU Video Conference</h1>
+        
+        <div class="controls">
+            <input type="text" id="roomIdInput" placeholder="Room ID" value="test-room">
+            <button id="joinBtn">Join Room</button>
+            <button id="leaveBtn">Leave Room</button>
+            <button id="toggleVideoBtn">Toggle Video</button>
+            <button id="toggleAudioBtn">Toggle Audio</button>
+        </div>
+        
+        <div class="room-info">
+            <div>
+                <p>Current Room: <span id="currentRoom">Not connected</span></p>
+                <p>Participants: <span id="participantCount">0</span></p>
+            </div>
+            <div class="status disconnected" id="connectionStatus">Disconnected</div>
+        </div>
+        
+        <div class="video-grid" id="videoGrid">
+            <div class="video-container">
+                <video id="localVideo" autoplay muted playsinline></video>
+                <div class="label">You (Local)</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            // DOM Elements
+            const joinBtn = document.getElementById('joinBtn');
+            const leaveBtn = document.getElementById('leaveBtn');
+            const toggleVideoBtn = document.getElementById('toggleVideoBtn');
+            const toggleAudioBtn = document.getElementById('toggleAudioBtn');
+            const roomIdInput = document.getElementById('roomIdInput');
+            const currentRoomSpan = document.getElementById('currentRoom');
+            const participantCountSpan = document.getElementById('participantCount');
+            const connectionStatusDiv = document.getElementById('connectionStatus');
+            const localVideo = document.getElementById('localVideo');
+            const videoGrid = document.getElementById('videoGrid');
+            
+            // WebRTC configuration
+            const rtcConfig = {
+                iceServers: [
+      {
+        urls: "stun:stun.relay.metered.ca:80",
+      },
+      {
+        urls: "turn:global.relay.metered.ca:80",
+        username: "f5baae95181d1a3b2947f791",
+        credential: "n67tiC1skstIO4zc",
+      },
+      {
+        urls: "turn:global.relay.metered.ca:80?transport=tcp",
+        username: "f5baae95181d1a3b2947f791",
+        credential: "n67tiC1skstIO4zc",
+      },
+      {
+        urls: "turn:global.relay.metered.ca:443",
+        username: "f5baae95181d1a3b2947f791",
+        credential: "n67tiC1skstIO4zc",
+      },
+      {
+        urls: "turns:global.relay.metered.ca:443?transport=tcp",
+        username: "f5baae95181d1a3b2947f791",
+        credential: "n67tiC1skstIO4zc",
+      },
+  ],
+            };
+            
+            // State variables
+            let socket;
+            let currentRoom = null;
+            let localStream = null;
+            let publisherPc = null;                // Connection to send our media to the server
+            const consumerPcs = new Map();         // Connections to receive media from the server (one per remote participant)
+            const remoteParticipants = new Set();  // Set of participant IDs
+            
+            // Update connection status UI
+            function updateConnectionStatus(status, connected = false) {
+                connectionStatusDiv.textContent = status;
+                if (connected) {
+                    connectionStatusDiv.classList.remove('disconnected');
+                    connectionStatusDiv.classList.add('connected');
+                } else {
+                    connectionStatusDiv.classList.remove('connected');
+                    connectionStatusDiv.classList.add('disconnected');
+                }
+            }
+            
+            // Update participant count UI
+            function updateParticipantCount() {
+                participantCountSpan.textContent = remoteParticipants.size;
+            }
+            
+            // Connect to signaling server
+            function connectSocket() {
+                if (socket) return;
+                
+                socket = io.connect();
+                
+                socket.on('connect', () => {
+                    console.log('Connected to signaling server');
+                    updateConnectionStatus('Connected to server', true);
+                });
+                
+                socket.on('disconnect', () => {
+                    console.log('Disconnected from signaling server');
+                    updateConnectionStatus('Disconnected from server');
+                    cleanupRoom();
+                });
+                
+                socket.on('roomJoined', (data) => {
+                    console.log(`Joined room: ${data.roomId}, existing participants:`, data.participants);
+                    currentRoom = data.roomId;
+                    currentRoomSpan.textContent = data.roomId;
+                    
+                    // Add existing participants
+                    data.participants.forEach(participantId => {
+                        addRemoteParticipant(participantId);
+                    });
+                    updateParticipantCount();
+                    
+                    // Start publishing our media
+                    startPublishing();
+                    
+                    // Log status
+                    console.log(`Ready to receive streams from ${data.participants.length} existing participants`);
+                });
+                
+                socket.on('participantJoined', (participantId) => {
+                    console.log(`Participant joined: ${participantId}`);
+                    addRemoteParticipant(participantId);
+                    updateParticipantCount();
+                });
+                
+                socket.on('participantLeft', (participantId) => {
+                    console.log(`Participant left: ${participantId}`);
+                    removeRemoteParticipant(participantId);
+                    updateParticipantCount();
+                });
+                
+                socket.on('sessionDescription', async (data) => {
+                    try {
+                        // If this is an answer to our publisher offer
+                        if (data.type === 'publisher') {
+                            if (publisherPc) {
+                                await publisherPc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+                                console.log('Set publisher remote description (answer from server)');
+                            }
+                        } 
+                        // If this is an offer for a consumer
+                        else if (data.type === 'consumer') {
+                            const { publisherId, sdp } = data;
+                            console.log(`Received consumer offer for ${publisherId}`);
+                            
+                            // Add this participant if not already tracked
+                            if (!remoteParticipants.has(publisherId)) {
+                                addRemoteParticipant(publisherId);
+                                updateParticipantCount();
+                            }
+                            
+                            // Create consumer connection if it doesn't exist
+                            let consumerPc = consumerPcs.get(publisherId);
+                            if (!consumerPc) {
+                                consumerPc = createConsumerPeerConnection(publisherId);
+                                consumerPcs.set(publisherId, consumerPc);
+                                console.log(`Created new consumer connection for ${publisherId}`);
+                            }
+                            
+                            // Set remote description (offer)
+                            await consumerPc.setRemoteDescription(new RTCSessionDescription(sdp));
+                            
+                            // Create and set local description (answer)
+                            const answer = await consumerPc.createAnswer();
+                            await consumerPc.setLocalDescription(answer);
+                            
+                            // Send answer to server
+                            socket.emit('consumerAnswer', {
+                                publisherId: publisherId,
+                                sdp: answer
+                            });
+                            
+                            console.log(`Sent consumer answer for ${publisherId}`);
+                        }
+                    } catch (error) {
+                        console.error('Error handling session description:', error);
+                    }
+                });
+                
+                socket.on('iceCandidate', async (data) => {
+                    try {
+                        const { type, publisherId, candidate } = data;
+                        
+                        if (type === 'publisher' && publisherPc) {
+                            await publisherPc.addIceCandidate(new RTCIceCandidate(candidate));
+                        } else if (type === 'consumer' && publisherId) {
+                            const consumerPc = consumerPcs.get(publisherId);
+                            if (consumerPc) {
+                                await consumerPc.addIceCandidate(new RTCIceCandidate(candidate));
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error handling ICE candidate:', error);
+                    }
+                });
+            }
+            
+            // Join a room
+            joinBtn.addEventListener('click', () => {
+                const roomId = roomIdInput.value.trim();
+                if (!roomId) {
+                    alert('Please enter a room ID');
+                    return;
+                }
+                
+                connectSocket();
+                
+                // Request camera/microphone access
+                navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+                    .then(stream => {
+                        localStream = stream;
+                        localVideo.srcObject = stream;
+                        
+                        // Join the room
+                        socket.emit('joinRoom', roomId);
+                    })
+                    .catch(error => {
+                        console.error('Error accessing media devices:', error);
+                        alert(`Failed to access camera and microphone: ${error.message}`);
+                    });
+            });
+            
+            // Leave the room
+            leaveBtn.addEventListener('click', () => {
+                if (socket && currentRoom) {
+                    socket.emit('leaveRoom');
+                    cleanupRoom();
+                }
+            });
+            
+            // Toggle video
+            toggleVideoBtn.addEventListener('click', () => {
+                if (localStream) {
+                    const videoTrack = localStream.getVideoTracks()[0];
+                    if (videoTrack) {
+                        videoTrack.enabled = !videoTrack.enabled;
+                        toggleVideoBtn.textContent = videoTrack.enabled ? 'Disable Video' : 'Enable Video';
+                    }
+                }
+            });
+            
+            // Toggle audio
+            toggleAudioBtn.addEventListener('click', () => {
+                if (localStream) {
+                    const audioTrack = localStream.getAudioTracks()[0];
+                    if (audioTrack) {
+                        audioTrack.enabled = !audioTrack.enabled;
+                        toggleAudioBtn.textContent = audioTrack.enabled ? 'Mute Audio' : 'Unmute Audio';
+                    }
+                }
+            });
+            
+            // Start publishing our media to the server
+            function startPublishing() {
+                if (!localStream || !socket) return;
+                
+                // Create a new RTCPeerConnection for publishing
+                publisherPc = new RTCPeerConnection(rtcConfig);
+                
+                // Add all local tracks to this connection
+                localStream.getTracks().forEach(track => {
+                    publisherPc.addTrack(track, localStream);
+                });
+                
+                // Handle ICE candidates
+                publisherPc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        socket.emit('iceCandidate', {
+                            type: 'publisher',
+                            candidate: event.candidate
+                        });
+                    }
+                };
+                
+                // Handle connection state changes
+                publisherPc.onconnectionstatechange = () => {
+                    console.log('Publisher connection state:', publisherPc.connectionState);
+                };
+                
+                // Create an offer to send our media
+                publisherPc.createOffer()
+                    .then(offer => publisherPc.setLocalDescription(offer))
+                    .then(() => {
+                        // Send the offer to the server
+                        socket.emit('publisherOffer', publisherPc.localDescription);
+                    })
+                    .catch(error => {
+                        console.error('Error creating publisher offer:', error);
+                    });
+            }
+            
+            // Create a peer connection to receive media for a specific participant
+            function createConsumerPeerConnection(publisherId) {
+                const pc = new RTCPeerConnection(rtcConfig);
+                
+                // Handle incoming tracks
+                pc.ontrack = (event) => {
+                    console.log(`Received track from ${publisherId}`);
+                    
+                    // Get the remote stream
+                    const remoteStream = event.streams[0];
+                    
+                    // Create or get the video element for this participant
+                    let videoContainer = document.getElementById(`container-${publisherId}`);
+                    if (!videoContainer) {
+                        videoContainer = document.createElement('div');
+                        videoContainer.id = `container-${publisherId}`;
+                        videoContainer.className = 'video-container';
+                        
+                        const video = document.createElement('video');
+                        video.id = `remote-${publisherId}`;
+                        video.autoplay = true;
+                        video.playsInline = true;
+                        
+                        const label = document.createElement('div');
+                        label.className = 'label';
+                        label.textContent = `Participant ${publisherId.substring(0, 6)}...`;
+                        
+                        videoContainer.appendChild(video);
+                        videoContainer.appendChild(label);
+                        videoGrid.appendChild(videoContainer);
+                        
+                        console.log(`Created new video element for ${publisherId}`);
+                    }
+                    
+                    // Set the stream as the source for the video element
+                    const videoEl = document.getElementById(`remote-${publisherId}`);
+                    if (videoEl && videoEl.srcObject !== remoteStream) {
+                        videoEl.srcObject = remoteStream;
+                        console.log(`Set stream source for ${publisherId}`);
+                        
+                        // Ensure the video plays
+                        videoEl.play().catch(error => {
+                            console.warn(`Auto-play failed for ${publisherId}:`, error);
+                        });
+                    }
+                };
+                
+                // Handle ICE candidates
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        socket.emit('iceCandidate', {
+                            type: 'consumer',
+                            publisherId: publisherId,
+                            candidate: event.candidate
+                        });
+                    }
+                };
+                
+                // Handle connection state changes
+                pc.onconnectionstatechange = () => {
+                    console.log(`Consumer connection state (${publisherId}):`, pc.connectionState);
+                    
+                    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                        removeRemoteParticipant(publisherId);
+                    }
+                };
+                
+                return pc;
+            }
+            
+            // Add a remote participant
+            function addRemoteParticipant(participantId) {
+                remoteParticipants.add(participantId);
+                
+                // We don't create the consumer connection here - it will be created
+                // when we receive the consumer offer from the server
+            }
+            
+            // Remove a remote participant
+            function removeRemoteParticipant(participantId) {
+                remoteParticipants.delete(participantId);
+                
+                // Close and remove the consumer connection
+                const consumerPc = consumerPcs.get(participantId);
+                if (consumerPc) {
+                    consumerPc.close();
+                    consumerPcs.delete(participantId);
+                }
+                
+                // Remove the video element
+                const videoContainer = document.getElementById(`container-${participantId}`);
+                if (videoContainer) {
+                    videoContainer.remove();
+                }
+            }
+            
+            // Clean up when leaving a room
+            function cleanupRoom() {
+                // Close publisher connection
+                if (publisherPc) {
+                    publisherPc.close();
+                    publisherPc = null;
+                }
+                
+                // Close all consumer connections
+                for (const pc of consumerPcs.values()) {
+                    pc.close();
+                }
+                consumerPcs.clear();
+                
+                // Stop all tracks in the local stream
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                    localVideo.srcObject = null;
+                    localStream = null;
+                }
+                
+                // Clear all remote video elements
+                for (const participantId of remoteParticipants) {
+                    const videoContainer = document.getElementById(`container-${participantId}`);
+                    if (videoContainer) {
+                        videoContainer.remove();
+                    }
+                }
+                
+                // Reset state
+                remoteParticipants.clear();
+                currentRoom = null;
+                currentRoomSpan.textContent = 'Not connected';
+                updateParticipantCount();
+                updateConnectionStatus('Disconnected');
+                
+                // Reset button text
+                toggleVideoBtn.textContent = 'Toggle Video';
+                toggleAudioBtn.textContent = 'Toggle Audio';
+            }
+        });
+    </script>
+</body>
+</html>
