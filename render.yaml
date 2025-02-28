@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: socket-server
+    env: node
+    buildCommand: apt-get update && apt-get install -y build-essential python3 node-gyp && npm install
+    startCommand: node index.js
